@@ -1,0 +1,26 @@
+[workspace]
+authors = ["willyliulk <liulk3@gmail.com>"]
+channels = ["conda-forge"]
+name = "Research"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+profile-target = "pixi run python jaxTraining/train_target_ppo.py --phase auto --profile --dry-run"
+tb = "tensorboard --logdir=/tmp/tensorboard_jax --bind_all"
+train-target = "pixi run python jaxTraining/train_target_ppo.py"
+
+[dependencies]
+python = ">=3.14.6,<3.15"
+pip = ">=26.1.2,<27"
+pandas = ">=3.0.3,<4"
+requests = ">=2.34.2,<3"
+
+[pypi-dependencies]
+jax = { version = ">=0.10.2, <0.11", extras = ["cuda12"] }
+python-telegram-bot = ">=22.8, <23"
+optax = ">=0.2.8, <0.3"
+jaxlib = ">=0.10.2, <0.11"
+flax = ">=0.12.7, <0.13"
+tensorboard = ">=2.21.0, <3"
+tensorboard-plugin-profile = ">=2.20.7, <3"

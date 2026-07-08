@@ -1,0 +1,6 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+*.csv
+jaxTraining/checkpoints/*
