@@ -14,16 +14,16 @@ class TransformerEncoder(nn.Module):
         x = x + pos_emb
         
         for _ in range(2):
-            attn_out = nn.MultiHeadDotProductAttention(num_heads=self.num_heads, qkv_features=self.qkv_features)(x, x)
+            attn_out = nn.MultiHeadDotProductAttention(num_heads=self.num_heads, qkv_features=self.qkv_features, dtype=jnp.bfloat16)(x, x)
             x = x + attn_out
-            x = nn.LayerNorm()(x)
+            x = nn.LayerNorm(dtype=jnp.bfloat16)(x)
             
             mlp_out = nn.Sequential([
-                nn.Dense(self.mlp_dim), nn.relu,
-                nn.Dense(x.shape[-1])
+                nn.Dense(self.mlp_dim, dtype=jnp.bfloat16), nn.relu,
+                nn.Dense(x.shape[-1], dtype=jnp.bfloat16)
             ])(x)
             x = x + mlp_out
-            x = nn.LayerNorm()(x)
+            x = nn.LayerNorm(dtype=jnp.bfloat16)(x)
             
         return jnp.mean(x, axis=1)
 
@@ -38,21 +38,23 @@ class TargetActorCritic(nn.Module):
         hist_feat = TransformerEncoder(num_heads=2, qkv_features=32, mlp_dim=64)(history)
         
         curr_feat = nn.Sequential([
-            nn.Dense(64), nn.relu,
-            nn.Dense(64), nn.relu
+            nn.Dense(64, dtype=jnp.bfloat16), nn.relu,
+            nn.Dense(64, dtype=jnp.bfloat16), nn.relu
         ])(current)
         
         fused = jnp.concatenate([hist_feat, curr_feat], axis=-1)
         
         x = nn.Sequential([
-            nn.Dense(128), nn.relu,
-            nn.Dense(128), nn.relu
+            nn.Dense(128, dtype=jnp.bfloat16), nn.relu,
+            nn.Dense(128, dtype=jnp.bfloat16), nn.relu
         ])(fused)
         
-        action_mean = nn.Dense(self.action_dim)(x)
+        action_mean = nn.Dense(self.action_dim, dtype=jnp.bfloat16)(x)
         action_logstd = self.param('logstd', nn.initializers.zeros, (self.action_dim,))
-        value = nn.Dense(1)(x)
-        return action_mean, action_logstd, jnp.squeeze(value, axis=-1)
+        value = nn.Dense(1, dtype=jnp.bfloat16)(x)
+        
+        # 強制轉回 float32 確保 PPO loss 計算精度
+        return action_mean.astype(jnp.float32), action_logstd.astype(jnp.float32), jnp.squeeze(value, axis=-1).astype(jnp.float32)
 
 import numpy as np
 import torch
