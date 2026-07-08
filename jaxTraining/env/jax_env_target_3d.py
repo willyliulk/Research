@@ -28,8 +28,6 @@ class EnvState:
     prev_R: float
     sim_time: float
     num_step: int
-    t_impact: float
-    nominal_closing_speed: float
     
     # History Buffer (Shape: [25, 3] -> R, LOS_yaw, LOS_pitch)
     history_buffer: jnp.ndarray
@@ -98,18 +96,21 @@ def get_obs(state: EnvState, params: EnvParams) -> Dict[str, jnp.ndarray]:
         "history": obs_history
     }
 
-def get_uav_obs(state: EnvState, params: EnvParams) -> jnp.ndarray:
+def get_uav_guidance_accel(state: EnvState, params: EnvParams) -> Tuple[float, float]:
+    """計算 UAV 的硬編碼導引律加速度 (PNG + PP)"""
     dx = state.tar_pos[0] - state.uav_pos[0]
     dy = state.tar_pos[1] - state.uav_pos[1]
     dz = state.tar_pos[2] - state.uav_pos[2]
     R = jnp.hypot(jnp.hypot(dx, dy), dz)
     
+    # UAV to Target LOS
     yaw_los = jnp.arctan2(dy, dx)
     pitch_los = jnp.arctan2(dz, jnp.hypot(dx, dy) + 1e-6)
     
-    yaw_error = wrap_pi(yaw_los - state.uav_yaw)
-    pitch_error = wrap_pi(pitch_los - state.uav_pitch)
+    yaw_err = wrap_pi(yaw_los - state.uav_yaw)
+    pitch_err = wrap_pi(pitch_los - state.uav_pitch)
     
+    # 速度向量
     ax_v = state.uav_vel * jnp.cos(state.uav_pitch) * jnp.cos(state.uav_yaw)
     ay_v = state.uav_vel * jnp.cos(state.uav_pitch) * jnp.sin(state.uav_yaw)
     az_v = state.uav_vel * jnp.sin(state.uav_pitch)
@@ -127,55 +128,110 @@ def get_uav_obs(state: EnvState, params: EnvParams) -> jnp.ndarray:
     d_r_xy = (dx * dvx + dy * dvy) / (r_xy + 1e-6)
     pitch_los_rate = (r_xy * dvz - dz * d_r_xy) / (R**2 + 1e-6)
     
-    obs = jnp.array([
-        jnp.clip(R / params.base_r, 0.0, 1.0),
-        yaw_error / jnp.pi,
-        pitch_error / (jnp.pi / 2),
-        jnp.clip(state.uav_vel / params.max_vel, -1.0, 1.0),
-        jnp.clip(yaw_los_rate / params.max_los_rate, -1.0, 1.0),
-        jnp.clip(pitch_los_rate / params.max_los_rate, -1.0, 1.0),
-        state.uav_pitch / (jnp.pi / 2)
-    ], dtype=jnp.float32)
+    closing_vel = -(dx*dvx + dy*dvy + dz*dvz) / (R + 1e-6)
     
-    obs = jnp.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
+    # PNG: a = N * V_c * LOS_rate
+    png_yaw_accel = params.N_png * closing_vel * yaw_los_rate
+    png_pitch_accel = params.N_png * closing_vel * pitch_los_rate
     
-    t_impact_norm = jnp.clip(state.t_impact / params.max_time, 0.0, 1.0)
-    t_current_norm = jnp.clip(state.sim_time / params.max_time, 0.0, 1.0)
+    # PP: a = K * Error
+    pp_yaw_accel = params.K_pp * yaw_err
+    pp_pitch_accel = params.K_pp * pitch_err
     
-    t_ideal_remaining = state.t_impact - state.sim_time
-    t_straight_remaining = R / state.nominal_closing_speed
-    time_deficit = jnp.clip((t_ideal_remaining - t_straight_remaining) / params.max_time, -1.0, 1.0)
+    # 判斷是否切換為 PP
+    use_pp = R < params.pp_dist_threshold
     
-    time_feats = jnp.array([t_impact_norm, t_current_norm, time_deficit], dtype=jnp.float32)
-    return jnp.concatenate([obs, time_feats])
+    cmd_yaw_accel = jnp.where(use_pp, pp_yaw_accel, png_yaw_accel)
+    cmd_pitch_accel = jnp.where(use_pp, pp_pitch_accel, png_pitch_accel)
+    
+    # Clip to max
+    cmd_yaw_accel = jnp.clip(cmd_yaw_accel, -params.uav_max_yaw_accel, params.uav_max_yaw_accel)
+    cmd_pitch_accel = jnp.clip(cmd_pitch_accel, -params.uav_max_pitch_accel, params.uav_max_pitch_accel)
+    
+    return cmd_pitch_accel, cmd_yaw_accel
 
-def step_env(key, state: EnvState, action: jnp.ndarray, uav_action: jnp.ndarray, params: EnvParams) -> Tuple[Dict[str, jnp.ndarray], EnvState, float, bool, Dict]:
+def get_uav_obs(state: EnvState, params: EnvParams) -> jnp.ndarray:
+    # 計算 UAV 推論模型的 10 維觀測向量 (dvx, dvy, dvz, dx, dy, dz, los_rate_y, los_rate_z, t_impact_norm, time_deficit)
+    dx = state.tar_pos[0] - state.uav_pos[0]
+    dy = state.tar_pos[1] - state.uav_pos[1]
+    dz = state.tar_pos[2] - state.uav_pos[2]
+    
+    # 笛卡爾速度差
+    uav_vx = state.uav_vel * jnp.cos(state.uav_pitch) * jnp.cos(state.uav_yaw)
+    uav_vy = state.uav_vel * jnp.cos(state.uav_pitch) * jnp.sin(state.uav_yaw)
+    uav_vz = state.uav_vel * jnp.sin(state.uav_pitch)
+    tar_vx = state.tar_vel * jnp.cos(state.tar_pitch) * jnp.cos(state.tar_yaw)
+    tar_vy = state.tar_vel * jnp.cos(state.tar_pitch) * jnp.sin(state.tar_yaw)
+    tar_vz = state.tar_vel * jnp.sin(state.tar_pitch)
+    
+    dvx = tar_vx - uav_vx
+    dvy = tar_vy - uav_vy
+    dvz = tar_vz - uav_vz
+    
+    R = jnp.hypot(jnp.hypot(dx, dy), dz)
+    v_close = -(dx*dvx + dy*dvy + dz*dvz) / (R + 1e-6)
+    
+    # Cross product for LOS rate vector (rel_pos x rel_vel)
+    cross_x = dy*dvz - dz*dvy
+    cross_y = dz*dvx - dx*dvz
+    cross_z = dx*dvy - dy*dvx
+    
+    los_rate_y = cross_y / (R**2 + 1e-6)
+    los_rate_z = cross_z / (R**2 + 1e-6)
+    
+    t_impact = jnp.clip(R / (v_close + 1e-6), 0.0, 30.0)
+    t_impact_norm = jnp.clip(t_impact / 30.0, -1.0, 1.0)
+    time_deficit = jnp.clip((params.max_time - state.sim_time)/params.max_time, 0.0, 1.0)
+    
+    obs = jnp.array([
+        dvx/1000.0, dvy/1000.0, dvz/1000.0,
+        dx/10000.0, dy/10000.0, dz/10000.0,
+        jnp.clip(los_rate_y * 10.0, -1.0, 1.0),
+        jnp.clip(los_rate_z * 10.0, -1.0, 1.0),
+        t_impact_norm,
+        time_deficit
+    ], dtype=jnp.float32)
+    return obs
+
+def step_env(key, state: EnvState, action: jnp.ndarray, arg4, arg5=None):
+    if arg5 is None:
+        uav_action = None
+        params = arg4
+    else:
+        uav_action = arg4
+        params = arg5
+        
     # Action 是 Target 的控制 (範圍 -1 ~ 1)
     tar_act = jnp.clip(action, -1.0, 1.0)
     tar_cmd_pitch_accel = tar_act[0] * params.tar_max_pitch_accel
     tar_cmd_yaw_accel = tar_act[1] * params.tar_max_yaw_accel
     
-    # UAV 透過神經網路提供的控制 (範圍 -1 ~ 1)
-    uav_act = jnp.clip(uav_action, -1.0, 1.0)
-    uav_cmd_pitch_accel = uav_act[0] * params.uav_max_pitch_accel
-    uav_cmd_yaw_accel = uav_act[1] * params.uav_max_yaw_accel
+    if uav_action is None:
+        # UAV 硬編碼控制
+        uav_cmd_pitch_accel, uav_cmd_yaw_accel = get_uav_guidance_accel(state, params)
+    else:
+        # 神經網路控制 (範圍 -1 ~ 1)
+        uav_act = jnp.clip(uav_action, -1.0, 1.0)
+        uav_cmd_pitch_accel = uav_act[0] * params.uav_max_pitch_accel
+        uav_cmd_yaw_accel = uav_act[1] * params.uav_max_yaw_accel
+
     
     # ── 二階系統響應 (Tau = 0.707) ──
     tau = 0.707
     wn = 1.0 / tau
     zeta = 0.707
     
-    # UAV 響應
-    uav_pitch_accel_rate = state.uav_pitch_accel_rate + params.dt * (wn**2 * (uav_cmd_pitch_accel - state.uav_actual_pitch_accel) - 2 * zeta * wn * state.uav_pitch_accel_rate)
-    uav_actual_pitch_accel = state.uav_actual_pitch_accel + params.dt * uav_pitch_accel_rate
-    uav_yaw_accel_rate = state.uav_yaw_accel_rate + params.dt * (wn**2 * (uav_cmd_yaw_accel - state.uav_actual_yaw_accel) - 2 * zeta * wn * state.uav_yaw_accel_rate)
-    uav_actual_yaw_accel = state.uav_actual_yaw_accel + params.dt * uav_yaw_accel_rate
+    # UAV 響應 (拔除二階延遲，改為一階瞬間發力，以對齊預訓練 UAV 模型與 Pygame 模擬環境)
+    uav_pitch_accel_rate = 0.0
+    uav_actual_pitch_accel = uav_cmd_pitch_accel
+    uav_yaw_accel_rate = 0.0
+    uav_actual_yaw_accel = uav_cmd_yaw_accel
     
-    # Target 響應
-    tar_pitch_accel_rate = state.tar_pitch_accel_rate + params.dt * (wn**2 * (tar_cmd_pitch_accel - state.tar_actual_pitch_accel) - 2 * zeta * wn * state.tar_pitch_accel_rate)
-    tar_actual_pitch_accel = state.tar_actual_pitch_accel + params.dt * tar_pitch_accel_rate
-    tar_yaw_accel_rate = state.tar_yaw_accel_rate + params.dt * (wn**2 * (tar_cmd_yaw_accel - state.tar_actual_yaw_accel) - 2 * zeta * wn * state.tar_yaw_accel_rate)
-    tar_actual_yaw_accel = state.tar_actual_yaw_accel + params.dt * tar_yaw_accel_rate
+    # Target 響應 (拔除二階延遲，改為一階瞬間發力，以實現完全公平的 0 延遲狗鬥)
+    tar_pitch_accel_rate = 0.0
+    tar_actual_pitch_accel = tar_cmd_pitch_accel
+    tar_yaw_accel_rate = 0.0
+    tar_actual_yaw_accel = tar_cmd_yaw_accel
     
     # ── 運動學積分 ──
     # UAV
@@ -242,24 +298,28 @@ def step_env(key, state: EnvState, action: jnp.ndarray, uav_action: jnp.ndarray,
     fuel_penalty = -0.01 * (jnp.abs(tar_act[0]) + jnp.abs(tar_act[1]))
     reward += fuel_penalty
     
-    # Penalty if target goes too high or too low (keep it between 500 and 8000 ideally, but hard bound at 0)
-    reward += jnp.where(next_tar_pos[2] < 500, -0.1, 0.0)
-    reward += jnp.where(next_tar_pos[2] > 8000, -0.1, 0.0)
+    # Penalty if target goes too high or too low
+    reward += jnp.where(next_tar_pos[2] < 1500, -0.5, 0.0) # 強烈懲罰低飛 (防止往地板鑽)
+    reward += jnp.where(next_tar_pos[2] > 9000, -0.1, 0.0)
+    
+    # Target 自己的出界判定 (限制戰鬥區域)
+    tar_oob = (jnp.abs(next_tar_pos[0]) > 10000.0) | (jnp.abs(next_tar_pos[1]) > 10000.0) | (next_tar_pos[2] > 10000.0)
     
     # Terminations
     hit = R < 30.0
     timeout = sim_time >= params.max_time
-    out_of_bounds = (R > params.base_r * 4.0) | (next_uav_pos[2] < 0.0) # UAV crashes or flies out
+    uav_crash = next_uav_pos[2] < 0.0
     tar_crash = next_tar_pos[2] < 0.0
     
-    done = hit | timeout | out_of_bounds | tar_crash
+    done = hit | timeout | tar_oob | uav_crash | tar_crash
     
     # Terminal Rewards
-    reward += jnp.where(hit, -100.0, 0.0)         #被 UAV 擊落
-    reward += jnp.where(tar_crash, -100.0, 0.0)   #目標自己墜海
+    reward += jnp.where(hit, -100.0, 0.0)         # 被 UAV 擊落
+    reward += jnp.where(tar_crash, -100.0, 0.0)   # 目標自己墜海
+    reward += jnp.where(tar_oob, -100.0, 0.0)     # 目標逃離戰區 (消極避戰)
     
-    # 成功存活到最後或甩開 UAV
-    success = timeout | out_of_bounds & (~tar_crash)
+    # 成功存活到最後或成功誘導 UAV 墜毀 (且自己沒事)
+    success = (timeout | uav_crash) & (~tar_crash) & (~tar_oob) & (~hit)
     reward += jnp.where(success, 100.0, 0.0)
     
     obs = get_obs(new_state, params)
@@ -268,7 +328,7 @@ def step_env(key, state: EnvState, action: jnp.ndarray, uav_action: jnp.ndarray,
         "hit": hit,
         "timeout": timeout,
         "tar_crash": tar_crash,
-        "out_of_bounds": out_of_bounds,
+        "out_of_bounds": tar_oob,
         "reward": reward,
         "episode_len": num_step
     }
@@ -276,7 +336,7 @@ def step_env(key, state: EnvState, action: jnp.ndarray, uav_action: jnp.ndarray,
     return obs, new_state, reward, done, info
 
 def reset_env(key, params: EnvParams) -> Tuple[Dict[str, jnp.ndarray], EnvState]:
-    keys = jax.random.split(key, 14)
+    keys = jax.random.split(key, 12)
     
     tar_spd = jax.random.uniform(keys[0], minval=300.0, maxval=800.0)
     uav_spd = tar_spd + jax.random.uniform(keys[1], minval=600.0, maxval=1200.0) # UAV much faster
@@ -320,24 +380,6 @@ def reset_env(key, params: EnvParams) -> Tuple[Dict[str, jnp.ndarray], EnvState]
     init_feat = jnp.array([prev_R, tar_yaw_err, tar_pitch_err])
     history_buffer = jnp.repeat(init_feat[None, :], 25, axis=0)
     
-    # ── 計算真實的閉合速度與物理極限攔截時間 ──
-    dir_x = dx / (prev_R + 1e-6)
-    dir_y = dy / (prev_R + 1e-6)
-    dir_z = dz / (prev_R + 1e-6)
-    
-    tar_vx = tar_spd * jnp.cos(tar_pitch) * jnp.cos(tar_yaw)
-    tar_vy = tar_spd * jnp.cos(tar_pitch) * jnp.sin(tar_yaw)
-    tar_vz = tar_spd * jnp.sin(tar_pitch)
-    
-    tar_flee_speed = tar_vx * dir_x + tar_vy * dir_y + tar_vz * dir_z
-    nominal_closing_speed = jnp.maximum(100.0, uav_spd - tar_flee_speed)
-    
-    t_min_intercept = prev_R / nominal_closing_speed
-    
-    # 隨機放大 1.1 ~ 1.5 倍
-    random_offset = jax.random.uniform(keys[12], minval=1.1, maxval=1.5)
-    t_impact = jnp.clip(t_min_intercept * random_offset, 0.0, params.max_time * 0.9)
-    
     state = EnvState(
         uav_pos=uav_pos, uav_vel=uav_spd, uav_yaw=uav_yaw, uav_pitch=uav_pitch,
         uav_actual_pitch_accel=0.0, uav_actual_yaw_accel=0.0,
@@ -346,7 +388,6 @@ def reset_env(key, params: EnvParams) -> Tuple[Dict[str, jnp.ndarray], EnvState]
         tar_actual_pitch_accel=0.0, tar_actual_yaw_accel=0.0,
         tar_pitch_accel_rate=0.0, tar_yaw_accel_rate=0.0,
         prev_R=prev_R, sim_time=0.0, num_step=0,
-        t_impact=t_impact, nominal_closing_speed=nominal_closing_speed,
         history_buffer=history_buffer
     )
     

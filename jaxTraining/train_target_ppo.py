@@ -30,7 +30,7 @@ from models.ppo_network import ActorCritic, sample_action, get_logprob, get_entr
 # =====================================================================
 NUM_ENVS = 2048
 NUM_STEPS = 64
-TOTAL_TIMESTEPS = 100_000_000
+TOTAL_TIMESTEPS = 1000_000_000
 NUM_EPOCHS = 5
 MINIBATCH_SIZE = 4096
 GAMMA = 0.9995
